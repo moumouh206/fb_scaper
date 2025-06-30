@@ -368,14 +368,13 @@ def collect_links(page, db_cursor, db_conn):
     print(f"\nLink collection finished. Total new links added in this session: {collected_count}")
 
 
-# --- PHASE 2: DATA EXTRACTION (VERSION 2.3 - FINAL SELECTORS) ---
-
+# --- PHASE 2: DATA EXTRACTION ---
 def process_links(page, db_conn):
-    """Fetches 'new' links from the DB, scrapes them with corrected image selectors."""
+    """Fetches links, scrapes data including location/phone, and inserts into DB."""
     print("\n--- PHASE 2: PROCESSING LINKS ---")
     
     cursor = db_conn.cursor(dictionary=True)
-    cursor.execute(f"SELECT id, url, fb_item_id FROM marketplace_links WHERE status = 'new' OR status = 'error' ORDER BY id ASC LIMIT {PROCESS_LIMIT} FOR UPDATE")
+    cursor.execute(f"SELECT id, url FROM marketplace_links WHERE status = 'new' OR status = 'error' ORDER BY id ASC LIMIT {PROCESS_LIMIT} FOR UPDATE")
     links_to_process = cursor.fetchall()
 
     if not links_to_process:
@@ -383,160 +382,97 @@ def process_links(page, db_conn):
         return
 
     link_ids = [link['id'] for link in links_to_process]
-    format_strings = ','.join(['%s'] * len(link_ids))
-    cursor.execute(f"UPDATE marketplace_links SET status = 'processing' WHERE id IN ({format_strings})", tuple(link_ids))
+    cursor.execute(f"UPDATE marketplace_links SET status = 'processing' WHERE id IN ({','.join(['%s']*len(link_ids))})", tuple(link_ids))
     db_conn.commit()
-    
-    print(f"Marked {len(links_to_process)} links as 'processing'. Starting extraction...")
+    print(f"Marked {len(links_to_process)} links as 'processing'.")
 
     for link in links_to_process:
         print(f"\n[Processing URL]: {link['url']}")
         final_status = 'error'
         
         try:
-            if page.is_closed():
-                raise ConnectionError("The page was closed unexpectedly. Stopping process.")
-
-            print("  > Step 1: Navigating and extracting data...")
+            if page.is_closed(): raise ConnectionError("Browser page closed.")
             page.goto(link['url'], wait_until='load', timeout=60000)
-            time.sleep(random.uniform(3, 5))
+            close_popups(page) # Proactively close pop-ups
+            time.sleep(random.uniform(2, 4))
 
-            try:
-                title_selector = "h1[dir='auto'] > span"
-                title = page.locator(title_selector).first.inner_text(timeout=10000)
-            except TimeoutError:
-                raise ValueError("Could not find Title. Skipping this listing.")
-
-            try:
-                # This selector finds the h1, then looks for the sibling div that contains the price span.
-                # This is much more reliable than a generic search for "DZD".
-                price_selector = "h1 + div span"
-                price_text = page.locator(price_selector).first.inner_text(timeout=10000)
-                
-                # Filter for digits. It will correctly handle "55,000" -> "55000".
-                price_digits = ''.join(filter(str.isdigit, price_text))
-                
-                if price_digits:
-                    price = int(price_digits)
-                else:
-                    # If the text was "FREE" or something else without numbers.
-                    print("  > Price text contained no digits. Defaulting price to 1.")
-                    price = 1
-
-            except TimeoutError:
-                raise ValueError("Could not find Price element using the new H1-based selector. Skipping.")
-            
-            # Click the "See more" button for the description if it exists
-            try:
-                see_more_button = page.locator('div[role="button"]:has-text("See more")').last
-                see_more_button.wait_for(state='visible', timeout=3000)
-                print("  > 'See more' button found, clicking it.")
-                see_more_button.click()
-                time.sleep(0.5)
-            except TimeoutError:
-                pass # No "See more" button is fine
-
-            title_selector = "h1[dir='auto'] > span"
-            title_element = page.locator(title_selector).first
-            try:
-                title_element.wait_for(lambda: title_element.inner_text() != "Chats", timeout=5000) # Shorter timeout now
-                title = title_element.inner_text()
-                hidden_info_str = "[hidden information]"
-                if hidden_info_str in title:
-                    title = title.replace(hidden_info_str, "").strip()
-            except TimeoutError:
-                 raise ValueError("Title did not load correctly (stuck on 'Chats').")
-            
-            # --- THIS IS THE NEW, HIGHLY SPECIFIC IMAGE SELECTOR ---
-            # It targets the main image AND the thumbnails, but nothing else.
-            # Selector 1: The main image, which is inside a div with class xal61yo
-            # Selector 2: The thumbnail images, which are inside buttons with aria-label starting with "Thumbnail"
+            # --- DEFINE SELECTORS ---
+            container_selector = "div.x12u81az"
+            title_selector = f"{container_selector} h1[dir='auto'] > span"
+            price_selector = f"{container_selector} span:has-text('DZD'), {container_selector} span:has-text('FREE')"
+            location_selector = 'div:has(h2:has-text("Location")) + div span:first-child'
+            desc_container_selector = 'div:has(h2:has-text("Description")) + div'
             img_selector = "div.xal61yo img, div[aria-label^='Thumbnail'] img"
+
+            # --- EXTRACT DATA ---
+            title = page.locator(title_selector).first.inner_text(timeout=10000)
+            price_text = page.locator(price_selector).first.inner_text(timeout=10000)
+            price_digits = ''.join(filter(str.isdigit, price_text))
+            price = int(price_digits) if price_digits else 1
             
             try:
-                print("  > Searching for property images...")
-                page.locator(img_selector).first.wait_for(state='visible', timeout=10000)
-                image_elements = page.locator(img_selector).all()
-                
-                # Use a set to get only unique image URLs, as the main image and first thumbnail are often duplicates
-                image_urls = sorted(list(set(
-                    [img.get_attribute('src') for img in image_elements if img.get_attribute('src') and 'scontent' in img.get_attribute('src')]
-                )))
-
-                if not image_urls:
-                    raise ValueError("Found image tags, but no valid src URLs.")
+                location_text = page.locator(location_selector).first.inner_text(timeout=5000)
             except TimeoutError:
-                raise ValueError("Could not find any images with the new selector. Skipping.")
-            
-            print(f"  > Found {len(image_urls)} unique property images.")
+                location_text = "Unknown"
 
-            # --- THE REST OF THE FUNCTION REMAINS THE SAME ---
-            print(f"  > Step 2: Downloading {len(image_urls)} images...")
-            downloaded_image_filenames = []
-            for img_url in image_urls:
-                timestamp_name = f"{int(time.time())}_{random.randint(100, 999)}.jpg"
-                file_name = download_image_with_name(img_url, timestamp_name) 
-                if file_name:
-                    downloaded_image_filenames.append(file_name)
-                else:
-                    raise ConnectionError(f"Failed to download image: {img_url}. Aborting this listing.")
+            try:
+                description = page.locator(desc_container_selector).first.inner_text(timeout=5000)
+            except TimeoutError:
+                description = title
             
-            if not downloaded_image_filenames:
-                raise ValueError("Image download resulted in zero successful downloads. Skipping.")
+            # --- INTEGRATE HELPER FUNCTIONS ---
+            phone_number = extract_phone_number(description)
+            commune_id, willaya_id = get_location_ids(db_conn, location_text)
+            
+            print(f"  > Data Extracted: Title='{title[:30]}...', Price={price}, Location='{location_text}', Phone='{phone_number}'")
 
-            print("  > Step 3: Inserting data into database...")
+            # --- IMAGE EXTRACTION ---
+            page.locator(img_selector).first.wait_for(state='visible', timeout=10000)
+            image_elements = page.locator(img_selector).all()
+            image_urls = sorted(list(set([img.get_attribute('src') for img in image_elements if img and img.get_attribute('src') and 'scontent' in img.get_attribute('src')])))
+            if not image_urls: raise ValueError("No valid image URLs found.")
+            print(f"  > Found {len(image_urls)} unique images.")
+            
+            # --- DOWNLOAD & INSERT ---
+            downloaded_image_filenames = [download_image_with_name(url, f"{int(time.time())}_{random.randint(100, 999)}.jpg") for url in image_urls]
+            if not all(downloaded_image_filenames): raise ConnectionError("An image failed to download.")
+
             property_data = {
-                'slug': slugify(title), 'userid': 1, 'type': random.randint(1, 5),
-                'choice': 'rent', 'willaya': 16, 'commune': 1601, 'title': title, 
-                'descritpion': description, 'surface': random.randint(50, 300),
-                'telephone': f"0{random.randint(5,7)}{random.randint(10000000, 99999999)}",
-                'price': price, 'priceunite': 'DA', 'bedroom': random.randint(1, 5),
-                'bethroom': random.randint(1, 2), 'pricenegiciae': 0, 
-                'balcony': random.choice([0, 1]), 'agent': 0, 'latitude': 36.77, 
-                'longitude': 3.05, 'status': 0, 'entry_date': datetime.now(), 
-                'published_at': datetime.now()
+                'slug': slugify(title), 'userid': 1, 'type': 1, 'choice': 'rent',
+                'willaya': willaya_id, 'commune': commune_id, 'location_text': location_text,
+                'title': title, 'descritpion': description, 'surface': 0, 'telephone': phone_number,
+                'price': price, 'priceunite': 'DA', 'bedroom': 0, 'bethroom': 0,
+                'pricenegiciae': 0, 'balcony': 0, 'agent': 0, 'latitude': 0, 'longitude': 0,
+                'status': 1, 'entry_date': datetime.now(), 'published_at': datetime.now()
             }
             
             prop_cursor = db_conn.cursor()
-            prop_sql = """
-            INSERT INTO properties (slug, userid, `type`, choice, willaya, commune, title, descritpion, surface, telephone, expiredin, price, pricenegiciae, priceunite, bedroom, bethroom, balcony, agent, latitude, longitude, `status`, entry_date, published_at) 
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 30, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """
-            prop_values = tuple(property_data.values())
-            prop_cursor.execute(prop_sql, prop_values)
+            prop_sql = """INSERT INTO properties (slug, userid, `type`, choice, willaya, commune, location_text, title, descritpion, surface, telephone, expiredin, price, pricenegiciae, priceunite, bedroom, bethroom, balcony, agent, latitude, longitude, `status`, entry_date, published_at) 
+                          VALUES (%(slug)s, %(userid)s, %(type)s, %(choice)s, %(willaya)s, %(commune)s, %(location_text)s, %(title)s, %(descritpion)s, %(surface)s, %(telephone)s, 30, %(price)s, %(pricenegiciae)s, %(priceunite)s, %(bedroom)s, %(bethroom)s, %(balcony)s, %(agent)s, %(latitude)s, %(longitude)s, %(status)s, %(entry_date)s, %(published_at)s)"""
+            prop_cursor.execute(prop_sql, property_data)
             property_id = prop_cursor.lastrowid
-            print(f"  > Inserted property, received new ID: {property_id}")
-
+            
             media_sql = "INSERT INTO media (model_id, model_type, file_name, user_id, created_at) VALUES (%s, 1, %s, %s, %s)"
-            media_values = [(property_id, filename, property_data['userid'], datetime.now()) for filename in downloaded_image_filenames]
+            media_values = [(property_id, fname, 1, datetime.now()) for fname in downloaded_image_filenames]
             prop_cursor.executemany(media_sql, media_values)
-            print(f"  > Inserted {len(media_values)} records into media table.")
             
             db_conn.commit()
-            print("  > Transaction committed successfully.")
+            print(f"  > SUCCESS: Property ID {property_id} and media saved.")
             final_status = 'completed'
 
         except (ValueError, ConnectionError, TimeoutError) as e:
-            print(f"  > SKIPPING listing due to a controlled error: {e}")
+            print(f"  > controlled_error: SKIPPING - {e}")
             db_conn.rollback()
-            final_status = 'error'
         except Exception as e:
-            print(f"  > FAILED to process {link['url']} due to an unexpected script error: {e}")
+            print(f"  > script_error: FAILED - {e}")
             db_conn.rollback()
-            final_status = 'error'
-            if "Target page" in str(e) or "browser has been closed" in str(e):
-                print("  > Browser has crashed. Stopping the process.")
-                break
-        
+            if "Target page" in str(e): break
         finally:
             update_cursor = db_conn.cursor()
             update_cursor.execute("UPDATE marketplace_links SET status = %s, processed_at = %s WHERE id = %s", (final_status, datetime.now(), link['id']))
             db_conn.commit()
             print(f"  > Marked link as '{final_status}'.")
-            time.sleep(random.uniform(5, 10))
-
-
-
+            time.sleep(random.uniform(3, 7))
 
 
 # --- MAIN EXECUTION LOGIC (MODIFIED FOR INFINITE SCROLL) ---
